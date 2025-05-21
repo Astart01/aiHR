@@ -21,6 +21,7 @@ import io
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import pdf2image
 
 # Установка заголовка страницы - это ДОЛЖНА быть первая команда Streamlit
 st.set_page_config(
@@ -323,11 +324,47 @@ def extract_text_from_pdf(pdf_file):
     except Exception as e:
         return f"[Ошибка] {e}"
 
+# Добавьте эту функцию перед функцией display_pdf
+def convert_pdf_to_images(pdf_file):
+    try:
+        pdf_file.seek(0)
+        # Значительно уменьшаем DPI для получения изображений меньшего размера
+        # Чем меньше DPI, тем меньше будет текст
+        images = pdf2image.convert_from_bytes(
+            pdf_file.read(),
+            dpi=72,  # Уменьшаем DPI до 72 (стандартное разрешение экрана)
+            fmt='jpeg',
+            size=(800, None)  # Ограничиваем ширину изображения 800 пикселями
+        )
+        return images
+    except Exception as e:
+        st.error(f"Ошибка при конвертации PDF в изображения: {e}")
+        return None
+
 def display_pdf(pdf_file):
-    pdf_file.seek(0)
-    base64_pdf = base64.b64encode(pdf_file.read()).decode("utf-8")
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
+    images = convert_pdf_to_images(pdf_file)
+    if images:
+        # Создаем вкладки для каждой страницы PDF
+        if len(images) > 1:
+            tabs = st.tabs([f"Стр. {i+1}" for i in range(len(images))])
+            for i, tab in enumerate(tabs):
+                with tab:
+                    # Создаем изображение с явным контролем размера
+                    img_resized = images[i].resize((800, int(800 * images[i].height / images[i].width)))
+                    st.image(img_resized, use_container_width=True)
+        else:
+            # Если только одна страница, просто показываем ее с уменьшенным размером
+            img_resized = images[0].resize((800, int(800 * images[0].height / images[0].width)))
+            st.image(img_resized, use_container_width=True)
+    else:
+        # Запасной вариант
+        try:
+            pdf_file.seek(0)
+            base64_pdf = base64.b64encode(pdf_file.read()).decode("utf-8")
+            pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600px" type="application/pdf"></iframe>'
+            st.markdown(pdf_display, unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"Не удалось отобразить PDF: {e}")
 
 def extract_resume_info(text):
     info = {
@@ -488,7 +525,7 @@ def login_page():
             else:
                 st.error("Неверный логин или пароль")
 
-# --- Основное приложение ---
+
 def main_app():
     model, scaler, tfidf = load_model()
     st.title("Классификация резюме менеджеров по продажам")
@@ -558,18 +595,29 @@ def main_app():
                 })
         st.session_state.results = results
         st.session_state.has_processed_files = True
+        st.rerun()  # Перезагружаем страницу после обработки файлов
     
+    # Этот блок должен быть вне условия обработки файлов, чтобы выполняться при каждой загрузке страницы
     if st.session_state.has_processed_files and st.session_state.results:
         for r in st.session_state.results:
             r["prediction_class"] = 1 if r["raw_proba"] >= THRESHOLD else 0
             if "raw_text" in r:
                 r["Комментарий"], is_red_flag = get_detailed_comment(r["raw_text"], r["prediction_class"], r["raw_proba"])
         
+        # Создаем DataFrame из результатов
         result_df = pd.DataFrame(st.session_state.results)
-        result_df["Файл"] = result_df["Файл"].str.replace('.pdf', '', regex=False)
-        result_df["Вероятность класса 1"] = result_df["Вероятность класса 1"].astype(float).map("{:.2f}".format)
-        result_df["Зарплата"] = result_df["Зарплата"].apply(lambda x: f"{int(x):,}".replace(',', ' ') if str(x).isdigit() else x)
         
+        # Убедимся, что raw_proba имеет числовой тип
+        result_df["raw_proba"] = pd.to_numeric(result_df["raw_proba"], errors='coerce')
+        
+        # Сортировка по вероятности от высокой к низкой
+        result_df = result_df.sort_values(by="raw_proba", ascending=False).reset_index(drop=True)
+        
+        # Продолжаем с обычным форматированием
+        result_df["Файл"] = result_df["Файл"].str.replace('.pdf', '', regex=False)
+        result_df["Вероятность класса 1"] = result_df["raw_proba"].astype(float).map("{:.2f}".format)
+        result_df["Зарплата"] = result_df["Зарплата"].apply(lambda x: f"{int(x):,}".replace(',', ' ') if str(x).isdigit() else x)
+    
         # Создаем контейнер для результатов
         st.write("### Результаты анализа")
     
@@ -676,7 +724,6 @@ def main_app():
                     st.session_state.selected_pdf = {"file": file_data, "name": file_name}
                     st.rerun()  # Перезагрузить страницу для отображения PDF
         
-
         # Создаем буфер для Excel файла
         buffer = io.BytesIO()
 
@@ -769,8 +816,6 @@ def main_app():
             st.session_state.results = []
             st.session_state.has_processed_files = False
             st.session_state.selected_rows = set()
-
-
                 
             # Сообщение об успешной очистке
             st.success("Все резюме успешно очищены!")
@@ -820,34 +865,34 @@ def main_app():
                 success = send_to_amocrm()
                 if success:
                     st.success("Данные успешно отправлены в AmoCRM!")
+    
+    # Если выбран PDF для просмотра, отображаем его
+    if hasattr(st.session_state, 'selected_pdf') and st.session_state.selected_pdf:
+        st.divider()
+        st.subheader(f"📄 Просмотр: {st.session_state.selected_pdf['name']}")
+        display_pdf(st.session_state.selected_pdf['file'])
         
-        # Если выбран PDF для просмотра, отображаем его
-        if hasattr(st.session_state, 'selected_pdf') and st.session_state.selected_pdf:
-            st.divider()
-            st.subheader(f"📄 Просмотр: {st.session_state.selected_pdf['name']}")
-            display_pdf(st.session_state.selected_pdf['file'])
-            
-            # Информация о кандидате
-            file_name = st.session_state.selected_pdf['name']
-            raw_text = st.session_state.processed_files[file_name]["raw_text"]
-            info = extract_resume_info(raw_text)
-            info_df = pd.DataFrame({
-                "Поле": ["Телефон", "Должность", "Город", "Возраст", "Пол", "Зарплата"],
-                "Значение": [
-                    info["phone"], 
-                    info["position"], 
-                    info["city"], 
-                    info["age"], 
-                    info["gender"],
-                    info["salary"]
-                ]
-            })
-            st.table(info_df)
-            
-            # Кнопка закрыть просмотр PDF
-            if st.button("Закрыть просмотр PDF"):
-                del st.session_state.selected_pdf
-                st.rerun()
+        # Информация о кандидате
+        file_name = st.session_state.selected_pdf['name']
+        raw_text = st.session_state.processed_files[file_name]["raw_text"]
+        info = extract_resume_info(raw_text)
+        info_df = pd.DataFrame({
+            "Поле": ["Телефон", "Должность", "Город", "Возраст", "Пол", "Зарплата"],
+            "Значение": [
+                info["phone"], 
+                info["position"], 
+                info["city"], 
+                info["age"], 
+                info["gender"],
+                info["salary"]
+            ]
+        })
+        st.table(info_df)
+        
+        # Кнопка закрыть просмотр PDF
+        if st.button("Закрыть просмотр PDF"):
+            del st.session_state.selected_pdf
+            st.rerun()
     else:
         if uploaded_files:
             st.info("Нажмите кнопку 'Обработать файлы' для анализа резюме.")
@@ -913,11 +958,8 @@ def main_app():
             except Exception as e:
                 st.error(f"Ошибка при загрузке резюме с почты: {e}")
                 st.info("Убедитесь, что файл pochtalion.py находится в той же директории и содержит функцию download_pdfs")
-# --- Главная ---
-# В функции main_app(), после отображения таблицы резюме и 
-# перед блоком "Добавляем кнопки для действий с выбранными резюме":
 
-# --- Главная ---
+
 # --- Главная ---
 def main():
     if st.session_state.authenticated:
